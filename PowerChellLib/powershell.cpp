@@ -10,6 +10,8 @@ void StartPowerShell()
     LPCWSTR pwszBannerText = L"Windows PowerChell\nCopyright (C) Microsoft Corporation. All rights reserved.";
     LPCWSTR pwszHelpText = L"Help message";
     LPCWSTR ppwszArguments[] = { NULL };
+    BSTR pwszOutput = NULL;
+    LPCWSTR pwszCommand = L"whoami | out-file out.log";
 
     if (!InitializeCommonLanguageRuntime(&cc, &pAppDomain))
         goto exit;
@@ -35,8 +37,16 @@ void StartPowerShell()
     if (!PatchSystemPolicyGetSystemLockdownPolicy(pAppDomain))
         PRINT_ERROR("Failed to disable Constrained Mode Language.\n");
 
-    if (!StartConsoleShell(pAppDomain, &vtInitialRunspaceConfiguration, pwszBannerText, pwszHelpText, ppwszArguments, ARRAYSIZE(ppwszArguments)))
+    //if (!StartConsoleShell(pAppDomain, &vtInitialRunspaceConfiguration, pwszBannerText, pwszHelpText, ppwszArguments, ARRAYSIZE(ppwszArguments)))
+    //    goto exit;
+
+    // Call our function instead of StartConsoleShell
+    if (!ExecutePowerShellCommand(pAppDomain, &vtInitialRunspaceConfiguration, pwszCommand, &pwszOutput))
         goto exit;
+
+    // Do something with the output
+    // Print the output using our new function
+    PrintPowerShellOutput(pwszOutput);
 
 exit:
     VariantClear(&vtInitialRunspaceConfiguration);
@@ -255,4 +265,179 @@ exit:
     VariantClear(&vtArguments);
 
     return bResult;
+}
+
+BOOL ExecutePowerShellCommand(mscorlib::_AppDomain* pAppDomain, VARIANT* pvtRunspaceConfiguration, LPCWSTR pwszCommand, BSTR* ppwszOutput)
+{
+    BOOL bResult = FALSE;
+    HRESULT hr;
+
+    // Declare all variables at the beginning of the function
+    BSTR bstrPowerShellFullName = NULL;
+    BSTR bstrObjectFullName = NULL;
+    BSTR bstrToStringMethodName = NULL;
+    mscorlib::_Assembly* pAutomationAssembly = NULL;
+    mscorlib::_Assembly* pMscorlib = NULL;
+    mscorlib::_Type* pPowerShellType = NULL;
+    mscorlib::_Type* pObjectType = NULL;
+    SAFEARRAY* pPowerShellMethods = NULL;
+    SAFEARRAY* pObjectMethods = NULL;
+    mscorlib::_MethodInfo* pCreateMethodInfo = NULL;
+    mscorlib::_MethodInfo* pToStringMethodInfo = NULL;
+    VARIANT vtEmpty = { 0 };
+    VARIANT vtPowerShellInstance = { 0 };
+    SAFEARRAY* pInstanceMethods = NULL;
+    mscorlib::_MethodInfo* pAddScriptMethodInfo = NULL;
+    mscorlib::_MethodInfo* pInvokeMethodInfo = NULL;
+    mscorlib::_MethodInfo* pOutStringMethodInfo = NULL;
+    SAFEARRAY* pAddScriptArgs = NULL;
+    SAFEARRAY* pOutStringArgs = NULL;
+    VARIANT vtAddScriptResult = { 0 };
+    VARIANT vtInvokeResult = { 0 };
+    VARIANT vtToStringResult = { 0 };
+    BSTR bstrCommandString = NULL;
+    VARIANT vtCommandString = { 0 };
+    LONG lArgumentIndex = 0;
+
+    // Collection handling for ToString operation
+    SAFEARRAY* pCollection = NULL;
+    LONG lLowerBound = 0, lUpperBound = 0;
+    void* pArrayData = NULL;
+    VARIANT* pArrayElements = NULL;
+    WCHAR wszOutputBuffer[8192] = { 0 };
+    size_t currentPos = 0;
+
+    // Initialize output parameter
+    if (ppwszOutput)
+        *ppwszOutput = NULL;
+
+    // STEP 1: Load the System.Management.Automation assembly and get PowerShell type
+    bstrPowerShellFullName = SysAllocString(L"System.Management.Automation.PowerShell");
+    if (!bstrPowerShellFullName)
+        goto exit;
+
+    if (!LoadAssembly(pAppDomain, ASSEMBLY_NAME_SYSTEM_MANAGEMENT_AUTOMATION, &pAutomationAssembly))
+        goto exit;
+
+    hr = pAutomationAssembly->GetType_2(bstrPowerShellFullName, &pPowerShellType);
+    EXIT_ON_HRESULT_ERROR(L"Assembly->GetType_2", hr);
+
+    if (!pPowerShellType)
+    {
+        wprintf(L"[-] PowerShell type not found.\n");
+        goto exit;
+    }
+
+    // STEP 2: Get the Create method and call it to create a PowerShell instance
+    hr = pPowerShellType->GetMethods(
+        static_cast<mscorlib::BindingFlags>(mscorlib::BindingFlags::BindingFlags_Static | mscorlib::BindingFlags::BindingFlags_Public),
+        &pPowerShellMethods
+    );
+    EXIT_ON_HRESULT_ERROR(L"Type->GetMethods", hr);
+
+    if (!FindMethodInArray(pPowerShellMethods, L"Create", 0, &pCreateMethodInfo))
+    {
+        wprintf(L"[-] Method PowerShell.Create() not found.\n");
+        goto exit;
+    }
+
+    hr = pCreateMethodInfo->Invoke_3(vtEmpty, NULL, &vtPowerShellInstance);
+    EXIT_ON_HRESULT_ERROR(L"MethodInfo->Invoke_3 (Create)", hr);
+
+    if (vtPowerShellInstance.vt == VT_EMPTY || vtPowerShellInstance.vt == VT_NULL)
+    {
+        wprintf(L"[-] PowerShell.Create() returned empty result.\n");
+        goto exit;
+    }
+
+    // STEP 3: Get instance methods and call AddScript with our command
+    hr = pPowerShellType->GetMethods(
+        static_cast<mscorlib::BindingFlags>(mscorlib::BindingFlags::BindingFlags_Instance | mscorlib::BindingFlags::BindingFlags_Public),
+        &pInstanceMethods
+    );
+    EXIT_ON_HRESULT_ERROR(L"Type->GetMethods (Instance)", hr);
+
+    if (!FindMethodInArray(pInstanceMethods, L"AddScript", 1, &pAddScriptMethodInfo))
+    {
+        wprintf(L"[-] Method PowerShell.AddScript() not found.\n");
+        goto exit;
+    }
+
+    // Create argument array for AddScript call
+    pAddScriptArgs = SafeArrayCreateVector(VT_VARIANT, 0, 1);
+    if (!pAddScriptArgs)
+        goto exit;
+
+    // Prepare the command string
+    bstrCommandString = SysAllocString(pwszCommand);
+    if (!bstrCommandString)
+        goto exit;
+
+    // Put command string into argument array at index 0
+    vtCommandString.vt = VT_BSTR;
+    vtCommandString.bstrVal = bstrCommandString;
+
+    lArgumentIndex = 0;
+    hr = SafeArrayPutElement(pAddScriptArgs, &lArgumentIndex, &vtCommandString);
+    EXIT_ON_HRESULT_ERROR(L"SafeArrayPutElement", hr);
+
+    // Call the AddScript method
+    hr = pAddScriptMethodInfo->Invoke_3(vtPowerShellInstance, pAddScriptArgs, &vtAddScriptResult);
+    EXIT_ON_HRESULT_ERROR(L"MethodInfo->Invoke_3 (AddScript)", hr);
+
+    // STEP 4: Invoke the PowerShell command and get the output
+    if (!FindMethodInArray(pInstanceMethods, L"Invoke", 0, &pInvokeMethodInfo))
+    {
+        wprintf(L"[-] Method PowerShell.Invoke() not found.\n");
+        goto exit;
+    }
+
+    hr = pInvokeMethodInfo->Invoke_3(vtPowerShellInstance, NULL, &vtInvokeResult);
+    EXIT_ON_HRESULT_ERROR(L"MethodInfo->Invoke_3 (Invoke)", hr);
+
+    // STEP 5: Somehow get and print the command's output 
+
+    if (!*ppwszOutput)
+    {
+        // If we still don't have output, provide a fallback
+        *ppwszOutput = SysAllocString(L"Command executed but output retrieval not implemented");
+    }
+
+    bResult = TRUE;
+
+exit:
+    // Clean up resources
+    if (bstrPowerShellFullName) SysFreeString(bstrPowerShellFullName);
+    if (bstrCommandString) SysFreeString(bstrCommandString);
+    if (pPowerShellMethods) SafeArrayDestroy(pPowerShellMethods);
+    if (pInstanceMethods) SafeArrayDestroy(pInstanceMethods);
+    if (pAddScriptArgs) SafeArrayDestroy(pAddScriptArgs);
+    if (pOutStringArgs) SafeArrayDestroy(pOutStringArgs);
+    if (pPowerShellType) pPowerShellType->Release();
+    if (pAutomationAssembly) pAutomationAssembly->Release();
+    if (pCreateMethodInfo) pCreateMethodInfo->Release();
+    if (pAddScriptMethodInfo) pAddScriptMethodInfo->Release();
+    if (pInvokeMethodInfo) pInvokeMethodInfo->Release();
+    if (pOutStringMethodInfo) pOutStringMethodInfo->Release();
+    VariantClear(&vtPowerShellInstance);
+    VariantClear(&vtAddScriptResult);
+    VariantClear(&vtInvokeResult);
+    //VariantClear(&vtOutStringName);
+
+    return bResult;
+}
+
+void PrintPowerShellOutput(BSTR pwszOutput)
+{
+    if (pwszOutput)
+    {
+        wprintf(L"PowerShell Output:\n");
+        wprintf(L"--------------------------------------------------\n");
+        wprintf(L"%s\n", pwszOutput);
+        wprintf(L"--------------------------------------------------\n");
+    }
+    else
+    {
+        wprintf(L"No output received from PowerShell command.\n");
+    }
 }
