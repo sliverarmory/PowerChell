@@ -2,7 +2,9 @@
 #include "common.h"
 #include "patch.h"
 
-void StartPowerShell()
+#include "../PowerChell/extensionutils.h"
+
+void StartPowerShell(LPCWSTR pwszCommand)
 {
     mscorlib::_AppDomain* pAppDomain = NULL;
     CLR_CONTEXT cc = { 0 };
@@ -11,7 +13,6 @@ void StartPowerShell()
     LPCWSTR pwszHelpText = L"Help message";
     LPCWSTR ppwszArguments[] = { NULL };
     BSTR pwszOutput = NULL;
-    LPCWSTR pwszCommand = L"whoami | out-file out.log";
 
     if (!InitializeCommonLanguageRuntime(&cc, &pAppDomain))
         goto exit;
@@ -43,10 +44,6 @@ void StartPowerShell()
     // Call our function instead of StartConsoleShell
     if (!ExecutePowerShellCommand(pAppDomain, &vtInitialRunspaceConfiguration, pwszCommand, &pwszOutput))
         goto exit;
-
-    // Do something with the output
-    // Print the output using our new function
-    PrintPowerShellOutput(pwszOutput);
 
 exit:
     VariantClear(&vtInitialRunspaceConfiguration);
@@ -267,6 +264,7 @@ exit:
     return bResult;
 }
 
+// The refactored ExecutePowerShellCommand function
 BOOL ExecutePowerShellCommand(mscorlib::_AppDomain* pAppDomain, VARIANT* pvtRunspaceConfiguration, LPCWSTR pwszCommand, BSTR* ppwszOutput)
 {
     BOOL bResult = FALSE;
@@ -274,38 +272,21 @@ BOOL ExecutePowerShellCommand(mscorlib::_AppDomain* pAppDomain, VARIANT* pvtRuns
 
     // Declare all variables at the beginning of the function
     BSTR bstrPowerShellFullName = NULL;
-    BSTR bstrObjectFullName = NULL;
-    BSTR bstrToStringMethodName = NULL;
+    BSTR bstrCommandString = NULL;
     mscorlib::_Assembly* pAutomationAssembly = NULL;
-    mscorlib::_Assembly* pMscorlib = NULL;
     mscorlib::_Type* pPowerShellType = NULL;
-    mscorlib::_Type* pObjectType = NULL;
     SAFEARRAY* pPowerShellMethods = NULL;
-    SAFEARRAY* pObjectMethods = NULL;
-    mscorlib::_MethodInfo* pCreateMethodInfo = NULL;
-    mscorlib::_MethodInfo* pToStringMethodInfo = NULL;
-    VARIANT vtEmpty = { 0 };
-    VARIANT vtPowerShellInstance = { 0 };
     SAFEARRAY* pInstanceMethods = NULL;
+    mscorlib::_MethodInfo* pCreateMethodInfo = NULL;
     mscorlib::_MethodInfo* pAddScriptMethodInfo = NULL;
     mscorlib::_MethodInfo* pInvokeMethodInfo = NULL;
-    mscorlib::_MethodInfo* pOutStringMethodInfo = NULL;
+    VARIANT vtEmpty = { 0 };
+    VARIANT vtPowerShellInstance = { 0 };
     SAFEARRAY* pAddScriptArgs = NULL;
-    SAFEARRAY* pOutStringArgs = NULL;
     VARIANT vtAddScriptResult = { 0 };
     VARIANT vtInvokeResult = { 0 };
-    VARIANT vtToStringResult = { 0 };
-    BSTR bstrCommandString = NULL;
     VARIANT vtCommandString = { 0 };
     LONG lArgumentIndex = 0;
-
-    // Collection handling for ToString operation
-    SAFEARRAY* pCollection = NULL;
-    LONG lLowerBound = 0, lUpperBound = 0;
-    void* pArrayData = NULL;
-    VARIANT* pArrayElements = NULL;
-    WCHAR wszOutputBuffer[8192] = { 0 };
-    size_t currentPos = 0;
 
     // Initialize output parameter
     if (ppwszOutput)
@@ -395,12 +376,30 @@ BOOL ExecutePowerShellCommand(mscorlib::_AppDomain* pAppDomain, VARIANT* pvtRuns
     hr = pInvokeMethodInfo->Invoke_3(vtPowerShellInstance, NULL, &vtInvokeResult);
     EXIT_ON_HRESULT_ERROR(L"MethodInfo->Invoke_3 (Invoke)", hr);
 
-    // STEP 5: Somehow get and print the command's output 
-
-    if (!*ppwszOutput)
+    // Add debug information about the returned object
+    /*
+    wprintf(L"[DEBUG] PowerShell.Invoke() result type: %d\n", vtInvokeResult.vt);
+    if (vtInvokeResult.vt == VT_UNKNOWN || vtInvokeResult.vt == VT_DISPATCH)
     {
-        // If we still don't have output, provide a fallback
-        *ppwszOutput = SysAllocString(L"Command executed but output retrieval not implemented");
+        wprintf(L"[DEBUG] Result is an object pointer: 0x%p\n", vtInvokeResult.punkVal);
+    }
+    */
+
+    // STEP 5: Process the output collection using the separate function
+    if (!ProcessPowerShellOutput(pAppDomain, &vtInvokeResult, ppwszOutput))
+    {
+        wprintf(L"[-] Failed to process PowerShell output.\n");
+
+        if (!*ppwszOutput)
+        {
+            // If we still don't have output, provide a fallback
+            *ppwszOutput = SysAllocString(L"Command executed but failed to process output");
+        }
+    }
+    else if (!*ppwszOutput)
+    {
+        // If processing succeeded but no output was returned
+        *ppwszOutput = SysAllocString(L"Command executed but no output was returned");
     }
 
     bResult = TRUE;
@@ -409,35 +408,222 @@ exit:
     // Clean up resources
     if (bstrPowerShellFullName) SysFreeString(bstrPowerShellFullName);
     if (bstrCommandString) SysFreeString(bstrCommandString);
+
     if (pPowerShellMethods) SafeArrayDestroy(pPowerShellMethods);
     if (pInstanceMethods) SafeArrayDestroy(pInstanceMethods);
     if (pAddScriptArgs) SafeArrayDestroy(pAddScriptArgs);
-    if (pOutStringArgs) SafeArrayDestroy(pOutStringArgs);
+
     if (pPowerShellType) pPowerShellType->Release();
     if (pAutomationAssembly) pAutomationAssembly->Release();
     if (pCreateMethodInfo) pCreateMethodInfo->Release();
     if (pAddScriptMethodInfo) pAddScriptMethodInfo->Release();
     if (pInvokeMethodInfo) pInvokeMethodInfo->Release();
-    if (pOutStringMethodInfo) pOutStringMethodInfo->Release();
+
     VariantClear(&vtPowerShellInstance);
     VariantClear(&vtAddScriptResult);
     VariantClear(&vtInvokeResult);
-    //VariantClear(&vtOutStringName);
 
     return bResult;
 }
 
-void PrintPowerShellOutput(BSTR pwszOutput)
+// New separate function for processing PowerShell output
+BOOL ProcessPowerShellOutput(mscorlib::_AppDomain* pAppDomain, VARIANT* pvtInvokeResult, BSTR* ppwszOutput)
 {
-    if (pwszOutput)
+    BOOL bResult = FALSE;
+    HRESULT hr;
+
+    // Declare all variables at the beginning of the function
+    BSTR bstrObjectFullName = NULL;
+    BSTR bstrICollectionFullName = NULL;
+    BSTR bstrIListFullName = NULL;
+    mscorlib::_Assembly* pMscorlib = NULL;
+    mscorlib::_Type* pObjectType = NULL;
+    mscorlib::_Type* pICollectionType = NULL;
+    mscorlib::_Type* pIListType = NULL;
+    SAFEARRAY* pObjectMethods = NULL;
+    SAFEARRAY* pICollectionMethods = NULL;
+    SAFEARRAY* pIListMethods = NULL;
+    mscorlib::_MethodInfo* pToStringMethodInfo = NULL;
+    mscorlib::_MethodInfo* pGetCountMethodInfo = NULL;
+    mscorlib::_MethodInfo* pGetItemMethodInfo = NULL;
+    VARIANT vtEmpty = { 0 };
+    SAFEARRAY* pGetItemArgs = NULL;
+    VARIANT vtToStringResult = { 0 };
+    VARIANT vtCountResult = { 0 };
+    VARIANT vtItemResult = { 0 };
+    VARIANT vtIndex = { 0 };
+    LONG lArgumentIndex = 0;
+    LONG lCollectionCount = 0;
+
+    // Output buffer
+    WCHAR wszOutputBuffer[8192] = { 0 };
+    size_t currentPos = 0;
+
+    // Initialize output parameter if provided
+    if (ppwszOutput)
+        *ppwszOutput = NULL;
+
+    // Check if we have a valid result to process
+    if (!pvtInvokeResult || pvtInvokeResult->vt != VT_UNKNOWN || !pvtInvokeResult->punkVal)
+        goto exit;
+
+    // Load necessary types and methods
+    bstrObjectFullName = SysAllocString(L"System.Object");
+    bstrICollectionFullName = SysAllocString(L"System.Collections.ICollection");
+    bstrIListFullName = SysAllocString(L"System.Collections.IList");
+
+    if (!bstrObjectFullName || !bstrICollectionFullName || !bstrIListFullName)
+        goto exit;
+
+    if (!LoadAssembly(pAppDomain, L"mscorlib", &pMscorlib))
+        goto exit;
+
+    hr = pMscorlib->GetType_2(bstrObjectFullName, &pObjectType);
+    EXIT_ON_HRESULT_ERROR(L"Assembly->GetType_2 (Object)", hr);
+
+    hr = pMscorlib->GetType_2(bstrICollectionFullName, &pICollectionType);
+    EXIT_ON_HRESULT_ERROR(L"Assembly->GetType_2 (ICollection)", hr);
+
+    hr = pMscorlib->GetType_2(bstrIListFullName, &pIListType);
+    EXIT_ON_HRESULT_ERROR(L"Assembly->GetType_2 (IList)", hr);
+
+    // Get ICollection methods to get Count
+    hr = pICollectionType->GetMethods(
+        static_cast<mscorlib::BindingFlags>(mscorlib::BindingFlags::BindingFlags_Instance | mscorlib::BindingFlags::BindingFlags_Public),
+        &pICollectionMethods
+    );
+    EXIT_ON_HRESULT_ERROR(L"Type->GetMethods (ICollection)", hr);
+
+    if (!FindMethodInArray(pICollectionMethods, L"get_Count", 0, &pGetCountMethodInfo))
     {
-        wprintf(L"PowerShell Output:\n");
-        wprintf(L"--------------------------------------------------\n");
-        wprintf(L"%s\n", pwszOutput);
-        wprintf(L"--------------------------------------------------\n");
+        wprintf(L"[-] Method ICollection.get_Count() not found.\n");
+        goto exit;
     }
-    else
+
+    // Get IList methods to get items
+    hr = pIListType->GetMethods(
+        static_cast<mscorlib::BindingFlags>(mscorlib::BindingFlags::BindingFlags_Instance | mscorlib::BindingFlags::BindingFlags_Public),
+        &pIListMethods
+    );
+    EXIT_ON_HRESULT_ERROR(L"Type->GetMethods (IList)", hr);
+
+    if (!FindMethodInArray(pIListMethods, L"get_Item", 1, &pGetItemMethodInfo))
     {
-        wprintf(L"No output received from PowerShell command.\n");
+        wprintf(L"[-] Method IList.get_Item() not found.\n");
+        goto exit;
     }
+
+    // Get Object.ToString method
+    hr = pObjectType->GetMethods(
+        static_cast<mscorlib::BindingFlags>(mscorlib::BindingFlags::BindingFlags_Instance | mscorlib::BindingFlags::BindingFlags_Public),
+        &pObjectMethods
+    );
+    EXIT_ON_HRESULT_ERROR(L"Type->GetMethods (Object)", hr);
+
+    if (!FindMethodInArray(pObjectMethods, L"ToString", 0, &pToStringMethodInfo))
+    {
+        wprintf(L"[-] Method Object.ToString() not found.\n");
+        goto exit;
+    }
+
+    // Get collection count
+    hr = pGetCountMethodInfo->Invoke_3(*pvtInvokeResult, NULL, &vtCountResult);
+    EXIT_ON_HRESULT_ERROR(L"MethodInfo->Invoke_3 (get_Count)", hr);
+
+    if (vtCountResult.vt == VT_I4)
+    {
+        lCollectionCount = vtCountResult.lVal;
+        //wprintf(L"[DEBUG] Collection contains %d items\n", lCollectionCount);
+
+        // Prepare for get_Item calls
+        pGetItemArgs = SafeArrayCreateVector(VT_VARIANT, 0, 1);
+        if (!pGetItemArgs)
+            goto exit;
+
+        // Process each item in the collection
+        for (LONG i = 0; i < lCollectionCount; i++)
+        {
+            // Set index for get_Item
+            vtIndex.vt = VT_I4;
+            vtIndex.lVal = i;
+
+            lArgumentIndex = 0;
+            hr = SafeArrayPutElement(pGetItemArgs, &lArgumentIndex, &vtIndex);
+            EXIT_ON_HRESULT_ERROR(L"SafeArrayPutElement (Index)", hr);
+
+            // Get item at index i
+            hr = pGetItemMethodInfo->Invoke_3(*pvtInvokeResult, pGetItemArgs, &vtItemResult);
+            if (FAILED(hr)) continue;
+
+            // Process the item
+            if (vtItemResult.vt == VT_BSTR)
+            {
+                // Item is already a string - append to buffer
+                //wprintf(L"[DEBUG] Item %d is a string: %s\n", i, vtItemResult.bstrVal);
+                logger.wlog(L"%ls\n", vtItemResult.bstrVal);
+
+                // Add to output buffer if there's room
+                if ((currentPos + SysStringLen(vtItemResult.bstrVal) + 2) < sizeof(wszOutputBuffer) / sizeof(WCHAR))
+                {
+                    wcscpy_s(&wszOutputBuffer[currentPos], sizeof(wszOutputBuffer) / sizeof(WCHAR) - currentPos, vtItemResult.bstrVal);
+                    currentPos += wcslen(vtItemResult.bstrVal);
+                    wcscpy_s(&wszOutputBuffer[currentPos], sizeof(wszOutputBuffer) / sizeof(WCHAR) - currentPos, L"\r\n");
+                    currentPos += 2;
+                }
+            }
+            else if (vtItemResult.vt == VT_UNKNOWN || vtItemResult.vt == VT_DISPATCH)
+            {
+                // Item is an object - call ToString
+                hr = pToStringMethodInfo->Invoke_3(vtItemResult, NULL, &vtToStringResult);
+                if (SUCCEEDED(hr) && vtToStringResult.vt == VT_BSTR)
+                {
+                    //wprintf(L"[DEBUG] Item %d ToString: %s\n", i, vtToStringResult.bstrVal);
+                    logger.wlog(L"%ls\n", vtToStringResult.bstrVal);
+
+                    // Add to output buffer if there's room
+                    if ((currentPos + SysStringLen(vtToStringResult.bstrVal) + 2) < sizeof(wszOutputBuffer) / sizeof(WCHAR))
+                    {
+                        wcscpy_s(&wszOutputBuffer[currentPos], sizeof(wszOutputBuffer) / sizeof(WCHAR) - currentPos, vtToStringResult.bstrVal);
+                        currentPos += wcslen(vtToStringResult.bstrVal);
+                        wcscpy_s(&wszOutputBuffer[currentPos], sizeof(wszOutputBuffer) / sizeof(WCHAR) - currentPos, L"\r\n");
+                        currentPos += 2;
+                    }
+                }
+                VariantClear(&vtToStringResult);
+            }
+
+            VariantClear(&vtItemResult);
+        }
+
+        // Set the output string
+        if (wszOutputBuffer[0] != L'\0' && ppwszOutput)
+        {
+            *ppwszOutput = SysAllocString(wszOutputBuffer);
+        }
+    }
+
+    bResult = TRUE;
+
+exit:
+    // Clean up resources
+    if (bstrObjectFullName) SysFreeString(bstrObjectFullName);
+    if (bstrICollectionFullName) SysFreeString(bstrICollectionFullName);
+    if (bstrIListFullName) SysFreeString(bstrIListFullName);
+
+    if (pObjectMethods) SafeArrayDestroy(pObjectMethods);
+    if (pICollectionMethods) SafeArrayDestroy(pICollectionMethods);
+    if (pIListMethods) SafeArrayDestroy(pIListMethods);
+    if (pGetItemArgs) SafeArrayDestroy(pGetItemArgs);
+
+    if (pObjectType) pObjectType->Release();
+    if (pICollectionType) pICollectionType->Release();
+    if (pIListType) pIListType->Release();
+    if (pMscorlib) pMscorlib->Release();
+    if (pToStringMethodInfo) pToStringMethodInfo->Release();
+    if (pGetCountMethodInfo) pGetCountMethodInfo->Release();
+    if (pGetItemMethodInfo) pGetItemMethodInfo->Release();
+
+    VariantClear(&vtCountResult);
+
+    return bResult;
 }

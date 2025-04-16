@@ -1,0 +1,23 @@
+{
+  "name": "PowerChell",
+  "package_name": "powerchell",
+  "version": "0.0.0",
+  "extension_author": "c2biz",
+  "original_author": "itm4n",
+  "repo_url": "https://github.com/sliverarmory/PowerChell",
+  "commands": [
+    {
+      "command_name": "powerchell",
+      "help": "Execute a PowerShell command from C++ DLL using only native code",
+      "long_help": "PowerShell execution in native C/C++, with security features patched/disabled.\nUsage:\n  -c,  command to execute\n\nExample:\n  powerchell -- -c ls c:/users/administrator/desktop/",
+      "entrypoint": "Go",
+      "files": [
+        {
+          "os": "windows",
+          "arch": "amd64",
+          "path": "PowerChell.dll"
+        }
+      ]
+    }
+  ]
+}
