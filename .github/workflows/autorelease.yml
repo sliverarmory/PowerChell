@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    branches: ["master"]
+
+jobs:
+  windows-build:
+    name: Cpp Build
+    if: startsWith( github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+  
+    - name: Check out code
+      uses: actions/checkout@v3
+    
+    - name: Add msbuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Git Fetch Tags
+      run: git fetch --prune --unshallow --tags -f
+
+    - name: Install jq via Chocolatey
+      run: |
+        choco install jq -y
+        
+    - name: Install minisign from moloch
+      run: |
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri https://github.com/moloch--/minisign/releases/download/v0.2.1/minisign.exe -OutFile minisign.exe
+
+    - name: Build solution
+      run: |
+        msbuild .\PowerChell.sln /p:Configuration="Release-DLL" /p:Platform=x64 /p:OutDir=.\compiled
+
+    - name: Build Package
+      run: |
+        $Version = git.exe describe --tags --abbrev=0
+        Get-Content -Path extension.json | jq.exe --arg ver "$Version" '.version |= $ver' > .\PowerChell\compiled\extension.json
+        cd .\PowerChell\compiled\
+        tar.exe -czvf ..\..\powerchell.tar.gz .\extension.json .\PowerChell.dll
+
+    - name: Sign Package
+      run: |
+        pwd
+        Write-Output "${{ secrets.MINISIGN_PRIVATE_KEY }}" > minisign.key
+        ls
+        $Content1 = Get-Content -Path .\PowerChell\compiled\extension.json
+        ls .\PowerChell\compiled\
+        $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Content1)
+        $Encoded = [System.Convert]::ToBase64String($Bytes)
+        .\minisign.exe -s minisign.key -S -m powerchell.tar.gz -t "$Encoded" -x powerchell.minisig
+
+    - name: "Publish Release"
+      uses: "marvinpinto/action-automatic-releases@latest"
+      with:
+        repo_token: "${{ secrets.GITHUB_TOKEN }}"
+        prerelease: false
+        files: |
+          powerchell.minisig
+          powerchell.tar.gz
